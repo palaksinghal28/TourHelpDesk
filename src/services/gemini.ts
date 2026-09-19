@@ -1,0 +1,139 @@
+export interface ChatMessage {
+  id: string
+  role: 'user' | 'model'
+  text: string
+  timestamp: string
+}
+
+export const TOURISM_SYSTEM_INSTRUCTION = `You are "GlobeDesk Helpdesk Agent", a world-renowned master specialist in global tourism, travel, geography, world heritage, and country exploration.
+
+Your core expertise and purpose:
+1. Provide rich, highly actionable, engaging, and expert advice on world tourism: destinations, day-by-day travel itineraries, hidden gems, visa requirements, best seasons/weather to visit, local customs, traditional cuisine, currency/costs, safety, packing recommendations, and transport options for ANY country, island, or city across the globe.
+2. Maintain full awareness of the multi-turn conversational context, referring back to previous destinations, budgets, or traveler preferences mentioned earlier in the chat.
+3. Keep responses well-structured, warm, and readable with concise bullet points, bold destination highlights, and clear sections.
+
+STRICT CONTEXT AND BOUNDARY ENFORCEMENT:
+- You ONLY answer questions related to world tourism, travel, geography, exploring countries/cities, cultures, local delicacies, and travel logistics.
+- If a user asks about ANY topic outside travel, tourism, geography, and vacation planning (e.g., programming/coding, mathematics, general tech, stock trading, homework, celebrity gossip, politics, non-travel medical/legal advice, etc.), you MUST politely and warmly decline and guide them back to world exploration.
+- Example boundary response:
+  "I am GlobeDesk's specialized tourism and travel helpdesk assistant. While that is an interesting topic, my expertise is strictly dedicated to world tourism, country guides, and travel planning! 🌍✈️ What country or destination can I help you plan your next journey to?"
+`
+
+export function getGeminiApiKey(): string {
+  // Check Vite environment variable first
+  const envKey = import.meta.env.VITE_GEMINI_API_KEY
+  if (envKey && typeof envKey === 'string' && envKey.trim() !== '') {
+    return envKey.trim()
+  }
+  // Check localStorage for browser-stored fallback key
+  const storedKey = localStorage.getItem('globedesk_gemini_api_key')
+  if (storedKey && storedKey.trim() !== '') {
+    return storedKey.trim()
+  }
+  return ''
+}
+
+export function saveGeminiApiKey(key: string): void {
+  if (key && key.trim() !== '') {
+    localStorage.setItem('globedesk_gemini_api_key', key.trim())
+  } else {
+    localStorage.removeItem('globedesk_gemini_api_key')
+  }
+}
+
+export async function sendChatMessage(
+  history: ChatMessage[],
+  newMessage: string,
+  apiKeyOverride?: string
+): Promise<string> {
+  const apiKey = apiKeyOverride || getGeminiApiKey()
+
+  if (!apiKey) {
+    throw new Error('MISSING_API_KEY')
+  }
+
+  // Format multi-turn history for Gemini API
+  // Gemini expects roles: 'user' and 'model'
+  const contents = [
+    ...history.map((msg) => ({
+      role: msg.role === 'user' ? 'user' : 'model',
+      parts: [{ text: msg.text }],
+    })),
+    {
+      role: 'user',
+      parts: [{ text: newMessage }],
+    },
+  ]
+
+  const payload = {
+    system_instruction: {
+      parts: [{ text: TOURISM_SYSTEM_INSTRUCTION }],
+    },
+    contents,
+    generationConfig: {
+      temperature: 0.7,
+      maxOutputTokens: 2048,
+    },
+  }
+
+  // Resilient multi-model waterfall to prevent high demand (503 / 429) disruptions
+  const candidateModels = [
+    'gemini-flash-lite-latest',
+    'gemini-flash-latest',
+    'gemini-3.6-flash',
+    'gemini-3.8-flash',
+    'gemini-3.5-flash-lite',
+    'gemini-3.1-flash-lite',
+  ]
+  let lastError: Error | null = null
+
+  for (const model of candidateModels) {
+    try {
+      const response = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(payload),
+        }
+      )
+
+      const data = await response.json()
+
+      if (!response.ok) {
+        const errorMsg = data.error?.message || `Gemini API error (Status ${response.status})`
+
+        // If invalid key, fail immediately without trying other models
+        if (
+          errorMsg.includes('API_KEY_INVALID') ||
+          errorMsg.includes('API key not valid') ||
+          (response.status === 400 && errorMsg.toLowerCase().includes('api key'))
+        ) {
+          throw new Error('API key is not valid. Please check your Gemini API key.')
+        }
+
+        // If high demand (503) or rate-limit (429), failover to next model in the waterfall
+        console.warn(`Model ${model} returned ${response.status} (${errorMsg}). Failing over to next model...`)
+        lastError = new Error(errorMsg)
+        continue
+      }
+
+      const candidateText = data.candidates?.[0]?.content?.parts?.[0]?.text
+      if (candidateText) {
+        return candidateText
+      }
+
+      throw new Error('No response text generated by Gemini API.')
+    } catch (err: any) {
+      if (err.message && (err.message.includes('API key is not valid') || err.message.includes('API_KEY_INVALID'))) {
+        throw err
+      }
+      lastError = err
+      console.warn(`Failed on model ${model}: ${err.message}. Trying next candidate model...`)
+    }
+  }
+
+  throw lastError || new Error('Failed to connect to Gemini API.')
+}
